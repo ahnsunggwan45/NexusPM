@@ -1,0 +1,6 @@
+name: NexusPM
+main: NexusPM\Main
+version: 0.1.0
+api: 5.0.0
+author: ahnsunggwan45
+description: Allows newer Bedrock clients to connect to PMMP servers by translating packets between protocol versions.

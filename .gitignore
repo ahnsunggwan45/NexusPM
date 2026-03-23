@@ -1,0 +1,26 @@
+# Dependencies
+vendor/
+composer.json
+composer.lock
+
+# Build artifacts
+*.phar
+
+# Tools (private)
+tools/
+
+# Dev docs
+NEXUSPM.md
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Server test
+NexusPM-Server/
+.idea/
+.claude/
