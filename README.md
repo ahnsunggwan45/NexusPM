@@ -4,6 +4,9 @@
 
 Allows newer Minecraft Bedrock clients to connect to PMMP servers running an older protocol version. Translates network packets, block palettes, and item tables between protocol versions at runtime.
 
+![v944 Preview client connected to v924 PMMP server](assets/in-game-sc.png)
+*Minecraft Preview v1.26.10 (protocol 944) connected to PocketMine-MP v1.26.0 (protocol 924)*
+
 ## Features
 
 - **Transparent multi-version support** — Newer clients connect and play without manual server updates
