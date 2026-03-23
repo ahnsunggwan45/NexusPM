@@ -1,0 +1,46 @@
+NexusPM Mapping Data Files
+==========================
+
+This folder contains version-specific block palette and item table data
+for protocol versions ABOVE the base version.
+
+The base version (v924 / 1.26.0) data comes from vendor/pocketmine/bedrock-data/
+and does NOT need to be duplicated here.
+
+
+Required files per version
+--------------------------
+For each new protocol version, you need:
+  - canonical_block_states-{gameVersion}.nbt   (block palette)
+  - required_item_list-{gameVersion}.json      (item table)
+
+Example for v944 (1.26.10):
+  - canonical_block_states-1.26.10.nbt
+  - required_item_list-1.26.10.json
+
+
+How to extract data files
+-------------------------
+
+Method 1: Wait for pmmp/BedrockData release
+  When PMMP updates their BedrockData repo with a new bedrock-X.XX.XX tag,
+  download the files from:
+    https://github.com/pmmp/BedrockData/tree/bedrock-{gameVersion}
+
+Method 2: Extract from BDS using bds-mod-mapping
+  See: https://github.com/pmmp/bds-mod-mapping
+  1. Clone pmmp/bds-modding-devkit
+  2. Download the target BDS version
+  3. Build and run the mapping mod
+  4. Copy output files here with the version suffix
+
+Method 3: Use the extraction script
+  php tools/extract-bds-data.php <bds_server_path> <game_version>
+
+
+After adding files
+------------------
+1. Ensure the filename matches the pattern above
+2. Check that BlockPaletteManager::PALETTE_VERSIONS has the protocol version
+3. Check that ItemTableManager::ITEM_TABLE_VERSIONS has the protocol version
+4. Both are updated automatically by: php tools/update-version.php
