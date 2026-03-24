@@ -175,6 +175,11 @@ class NexusNetworkSession extends NetworkSession{
 		return parent::sendDataPacket($packet, $immediate);
 	}
 
+	/** @var array<int, int> native item rid → target item rid (only changed ones) */
+	private array $itemIdNativeToTarget = [];
+	/** @var array<int, int> target item rid → native item rid (only changed ones) */
+	private array $itemIdTargetToNative = [];
+
 	/**
 	 * Remap ItemRegistryPacket: target version's runtime IDs,
 	 * preserving original componentNbt from plugins.
@@ -183,23 +188,29 @@ class NexusNetworkSession extends NetworkSession{
 		$targetItems = $this->itemTables[$this->clientProtocol];
 		$entries = [];
 
+		// Build native→target item runtime ID mapping
+		$this->itemIdNativeToTarget = [];
+		$this->itemIdTargetToNative = [];
+
 		foreach($packet->getEntries() as $entry){
 			$name = $entry->getStringId();
 			if(isset($targetItems[$name])){
-				// Remap to target version's runtime ID, keep original componentNbt
+				$nativeRid = $entry->getNumericId();
+				$targetRid = $targetItems[$name]["runtime_id"];
+				if($nativeRid !== $targetRid){
+					$this->itemIdNativeToTarget[$nativeRid] = $targetRid;
+					$this->itemIdTargetToNative[$targetRid] = $nativeRid;
+				}
 				$entries[] = new ItemTypeEntry(
 					$name,
-					$targetItems[$name]["runtime_id"],
+					$targetRid,
 					$entry->isComponentBased(),
 					$entry->getVersion(),
 					$entry->getComponentNbt()
 				);
 			}elseif($entry->isComponentBased()){
-				// Custom item (from plugins) — keep as-is even if not in target table
 				$entries[] = $entry;
 			}
-			// Items removed in target version (e.g., debug_stick in v944): DROP
-			// Their runtimeId would conflict with reassigned IDs in the target version
 		}
 
 		// Add items that exist only in the target version
@@ -210,6 +221,11 @@ class NexusNetworkSession extends NetworkSession{
 			if(!isset($known[$name])){
 				$entries[] = new ItemTypeEntry($name, $data["runtime_id"], $data["component_based"], $data["version"] ?? 0, $emptyNbt);
 			}
+		}
+
+		// Pass mapping to translation helper
+		if($this->translationHelper !== null && count($this->itemIdNativeToTarget) > 0){
+			$this->translationHelper->setItemIdMapping($this->itemIdNativeToTarget, $this->itemIdTargetToNative);
 		}
 
 		return ItemRegistryPacket::create($entries);

@@ -9,8 +9,10 @@ use NexusPM\mapping\RuntimeIdMapper;
 use NexusPM\utils\ReflectionCache;
 use pocketmine\network\mcpe\protocol\BlockActorDataPacket;
 use pocketmine\network\mcpe\protocol\BlockEventPacket;
+use pocketmine\network\mcpe\protocol\AddActorPacket;
 use pocketmine\network\mcpe\protocol\ClientboundPacket;
 use pocketmine\network\mcpe\protocol\ContainerOpenPacket;
+use pocketmine\network\mcpe\protocol\SetActorDataPacket;
 use pocketmine\network\mcpe\protocol\CreativeContentPacket;
 use pocketmine\network\mcpe\protocol\InventoryContentPacket;
 use pocketmine\network\mcpe\protocol\InventorySlotPacket;
@@ -50,6 +52,32 @@ class PacketTranslationHelper{
 
 	public function toBase(int $targetRid) : int{
 		return $this->blockTranslator?->targetToNative($targetRid) ?? $this->mapper->toBase($targetRid);
+	}
+
+	// ─── Item ID Mapping ──────────────────────────────────────
+
+	/** @var array<int, int> native item rid → target item rid */
+	private array $itemIdNativeToTarget = [];
+	/** @var array<int, int> target item rid → native item rid */
+	private array $itemIdTargetToNative = [];
+
+	public function setItemIdMapping(array $nativeToTarget, array $targetToNative) : void{
+		$this->itemIdNativeToTarget = $nativeToTarget;
+		$this->itemIdTargetToNative = $targetToNative;
+	}
+
+	private function translateItemStackItemId(\pocketmine\network\mcpe\protocol\types\inventory\ItemStack $stack) : void{
+		$id = $stack->getId();
+		if($id !== 0 && isset($this->itemIdNativeToTarget[$id])){
+			ReflectionCache::setValue($stack, "id", $this->itemIdNativeToTarget[$id]);
+		}
+	}
+
+	private function reverseItemStackItemId(\pocketmine\network\mcpe\protocol\types\inventory\ItemStack $stack) : void{
+		$id = $stack->getId();
+		if($id !== 0 && isset($this->itemIdTargetToNative[$id])){
+			ReflectionCache::setValue($stack, "id", $this->itemIdTargetToNative[$id]);
+		}
 	}
 
 	// ─── Y Coordinate Fix ──────────────────────────────────────
@@ -96,7 +124,12 @@ class PacketTranslationHelper{
 		foreach($blockPosPackets as $class){
 			if($packet instanceof $class){
 				$packet = clone $packet;
-				$packet->blockPosition = $this->encodeOutboundBlockPosition($packet->blockPosition);
+				try{
+					$bp = ReflectionCache::getValue($packet, "blockPosition");
+					if($bp instanceof BlockPosition){
+						ReflectionCache::setValue($packet, "blockPosition", $this->encodeOutboundBlockPosition($bp));
+					}
+				}catch(\ReflectionException){}
 				return $packet;
 			}
 		}
@@ -109,11 +142,15 @@ class PacketTranslationHelper{
 			return $packet;
 		}
 
-		// AddVolumeEntityPacket — has minBound AND maxBound
+		// AddVolumeEntityPacket — has minBound AND maxBound (private)
 		if($packet instanceof \pocketmine\network\mcpe\protocol\AddVolumeEntityPacket){
 			$packet = clone $packet;
-			$packet->minBound = $this->encodeOutboundBlockPosition($packet->minBound);
-			$packet->maxBound = $this->encodeOutboundBlockPosition($packet->maxBound);
+			try{
+				$min = ReflectionCache::getValue($packet, "minBound");
+				$max = ReflectionCache::getValue($packet, "maxBound");
+				if($min instanceof BlockPosition) ReflectionCache::setValue($packet, "minBound", $this->encodeOutboundBlockPosition($min));
+				if($max instanceof BlockPosition) ReflectionCache::setValue($packet, "maxBound", $this->encodeOutboundBlockPosition($max));
+			}catch(\ReflectionException){}
 			return $packet;
 		}
 
@@ -169,9 +206,9 @@ class PacketTranslationHelper{
 
 		if($packet instanceof InventorySlotPacket){
 			$stack = $packet->item->getItemStack();
-			if(!$stack->isNull() && $stack->getBlockRuntimeId() !== 0){
+			if(!$stack->isNull()){
 				$packet = clone $packet;
-				$this->translateItemStackBlockRid($stack);
+				$this->translateOutboundItemStack($stack);
 			}
 			return $packet;
 		}
@@ -180,8 +217,8 @@ class PacketTranslationHelper{
 			$changed = false;
 			foreach($packet->items as $wrapper){
 				$stack = $wrapper->getItemStack();
-				if(!$stack->isNull() && $stack->getBlockRuntimeId() !== 0){
-					$this->translateItemStackBlockRid($stack);
+				if(!$stack->isNull()){
+					$this->translateOutboundItemStack($stack);
 					$changed = true;
 				}
 			}
@@ -193,9 +230,9 @@ class PacketTranslationHelper{
 
 		if($packet instanceof MobEquipmentPacket){
 			$stack = $packet->item->getItemStack();
-			if(!$stack->isNull() && $stack->getBlockRuntimeId() !== 0){
+			if(!$stack->isNull()){
 				$packet = clone $packet;
-				$this->translateItemStackBlockRid($stack);
+				$this->translateOutboundItemStack($stack);
 			}
 			return $packet;
 		}
@@ -204,18 +241,69 @@ class PacketTranslationHelper{
 			$packet = clone $packet;
 			foreach($packet->getItems() as $entry){
 				$stack = $entry->getItem();
-				if(!$stack->isNull() && $stack->getBlockRuntimeId() !== 0){
-					$this->translateItemStackBlockRid($stack);
+				if(!$stack->isNull()){
+					$this->translateOutboundItemStack($stack);
 				}
 			}
 			return $packet;
 		}
 
+		if($packet instanceof AddActorPacket){
+			return $this->translateActorMetadataBlockRids($packet);
+		}
+
+		if($packet instanceof SetActorDataPacket){
+			return $this->translateSetActorData($packet);
+		}
+
 		return $packet;
 	}
 
-	private function translateItemStackBlockRid(\pocketmine\network\mcpe\protocol\types\inventory\ItemStack $stack) : void{
-		ReflectionCache::setValue($stack, "blockRuntimeId", $this->toTarget($stack->getBlockRuntimeId()));
+	private function translateActorMetadataBlockRids(AddActorPacket $packet) : AddActorPacket{
+		// FALLING_BLOCK 등 엔티티의 VARIANT 메타데이터에 블록 런타임 ID가 들어감
+		$variantKey = \pocketmine\network\mcpe\protocol\types\entity\EntityMetadataProperties::VARIANT;
+		if(isset($packet->metadata[$variantKey])){
+			$prop = $packet->metadata[$variantKey];
+			if($prop instanceof \pocketmine\network\mcpe\protocol\types\entity\IntMetadataProperty){
+				$native = $prop->getValue();
+				$target = $this->toTarget($native);
+				if($target !== $native){
+					$packet = clone $packet;
+					$packet->metadata[$variantKey] = new \pocketmine\network\mcpe\protocol\types\entity\IntMetadataProperty($target);
+				}
+			}
+		}
+		return $packet;
+	}
+
+	private function translateSetActorData(SetActorDataPacket $packet) : SetActorDataPacket{
+		$variantKey = \pocketmine\network\mcpe\protocol\types\entity\EntityMetadataProperties::VARIANT;
+		if(isset($packet->metadata[$variantKey])){
+			$prop = $packet->metadata[$variantKey];
+			if($prop instanceof \pocketmine\network\mcpe\protocol\types\entity\IntMetadataProperty){
+				$native = $prop->getValue();
+				$target = $this->toTarget($native);
+				if($target !== $native){
+					$packet = clone $packet;
+					$packet->metadata[$variantKey] = new \pocketmine\network\mcpe\protocol\types\entity\IntMetadataProperty($target);
+				}
+			}
+		}
+		return $packet;
+	}
+
+	private function translateOutboundItemStack(\pocketmine\network\mcpe\protocol\types\inventory\ItemStack $stack) : void{
+		if($stack->getBlockRuntimeId() !== 0){
+			ReflectionCache::setValue($stack, "blockRuntimeId", $this->toTarget($stack->getBlockRuntimeId()));
+		}
+		$this->translateItemStackItemId($stack);
+	}
+
+	private function reverseInboundItemStack(\pocketmine\network\mcpe\protocol\types\inventory\ItemStack $stack) : void{
+		if($stack->getBlockRuntimeId() !== 0){
+			ReflectionCache::setValue($stack, "blockRuntimeId", $this->toBase($stack->getBlockRuntimeId()));
+		}
+		$this->reverseItemStackItemId($stack);
 	}
 
 	private function translateSubChunkBlocks(UpdateSubChunkBlocksPacket $packet) : UpdateSubChunkBlocksPacket{
@@ -312,26 +400,26 @@ class PacketTranslationHelper{
 		// Reverse-translate block runtime ID (clicked block)
 		ReflectionCache::setValue($data, "blockRuntimeId", $this->toBase($data->getBlockRuntimeId()));
 
-		// Reverse-translate ItemStack::blockRuntimeId (held item)
+		// Reverse-translate ItemStack (held item)
 		$stack = $data->getItemInHand()->getItemStack();
-		if(!$stack->isNull() && $stack->getBlockRuntimeId() !== 0){
-			ReflectionCache::setValue($stack, "blockRuntimeId", $this->toBase($stack->getBlockRuntimeId()));
+		if(!$stack->isNull()){
+			$this->reverseInboundItemStack($stack);
 		}
 	}
 
 	/**
-	 * Reverse-translate blockRuntimeId in transaction actions (Q drop, inventory moves, etc.)
+	 * Reverse-translate item IDs and blockRuntimeId in transaction actions (Q drop, inventory moves, etc.)
 	 * @param \pocketmine\network\mcpe\protocol\types\inventory\NetworkInventoryAction[] $actions
 	 */
 	private function fixTransactionActions(array $actions) : void{
 		foreach($actions as $action){
 			$old = $action->oldItem->getItemStack();
-			if(!$old->isNull() && $old->getBlockRuntimeId() !== 0){
-				ReflectionCache::setValue($old, "blockRuntimeId", $this->toBase($old->getBlockRuntimeId()));
+			if(!$old->isNull()){
+				$this->reverseInboundItemStack($old);
 			}
 			$new = $action->newItem->getItemStack();
-			if(!$new->isNull() && $new->getBlockRuntimeId() !== 0){
-				ReflectionCache::setValue($new, "blockRuntimeId", $this->toBase($new->getBlockRuntimeId()));
+			if(!$new->isNull()){
+				$this->reverseInboundItemStack($new);
 			}
 		}
 	}
