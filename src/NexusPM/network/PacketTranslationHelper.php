@@ -6,6 +6,7 @@ namespace NexusPM\network;
 
 use NexusPM\mapping\NexusBlockTranslator;
 use NexusPM\mapping\RuntimeIdMapper;
+use NexusPM\utils\ReflectionCache;
 use pocketmine\network\mcpe\protocol\ClientboundPacket;
 use pocketmine\network\mcpe\protocol\LevelEventPacket;
 use pocketmine\network\mcpe\protocol\LevelSoundEventPacket;
@@ -14,131 +15,104 @@ use pocketmine\network\mcpe\protocol\UpdateBlockPacket;
 use pocketmine\network\mcpe\protocol\UpdateSubChunkBlocksPacket;
 use pocketmine\network\mcpe\protocol\types\BlockPosition;
 use pocketmine\network\mcpe\protocol\types\inventory\UseItemTransactionData;
+use pocketmine\network\mcpe\protocol\types\UpdateSubChunkBlocksPacketEntry;
 
 /**
- * Centralized packet translation helper.
- * Handles block runtime ID translation and Y-coordinate encoding fixes
- * for ALL relevant packets in one place.
+ * Centralized packet translation for a specific target protocol version.
  *
- * Outbound (server→client): translate native block runtime IDs → target version IDs
- * Inbound (client→server): reverse translate + fix Y coordinate encoding
+ * Handles:
+ *   - Outbound block runtime ID translation (native → target)
+ *   - Inbound block runtime ID reverse translation (target → native)
+ *   - Inbound Y-coordinate encoding fix (version-dependent)
+ *   - All block-containing packet types in one place
  */
 class PacketTranslationHelper{
 
-	private RuntimeIdMapper $mapper;
-	private ?NexusBlockTranslator $blockTranslator;
+	public function __construct(
+		private RuntimeIdMapper $mapper,
+		private ?NexusBlockTranslator $blockTranslator = null,
+		private bool $needsYFix = false
+	){}
 
-	public function __construct(RuntimeIdMapper $mapper, ?NexusBlockTranslator $blockTranslator = null){
-		$this->mapper = $mapper;
-		$this->blockTranslator = $blockTranslator;
+	// ─── Block ID Mapping ──────────────────────────────────────
+
+	public function toTarget(int $nativeRid) : int{
+		return $this->blockTranslator?->nativeToTarget($nativeRid) ?? $this->mapper->toTarget($nativeRid);
 	}
 
-	// ─── Block ID translation ──────────────────────────────────
-
-	public function mapBlockIdToTarget(int $nativeRid) : int{
-		if($this->blockTranslator !== null){
-			return $this->blockTranslator->nativeToTarget($nativeRid);
-		}
-		return $this->mapper->toTarget($nativeRid);
+	public function toBase(int $targetRid) : int{
+		return $this->blockTranslator?->targetToNative($targetRid) ?? $this->mapper->toBase($targetRid);
 	}
 
-	public function mapBlockIdToBase(int $targetRid) : int{
-		if($this->blockTranslator !== null){
-			return $this->blockTranslator->targetToNative($targetRid);
-		}
-		return $this->mapper->toBase($targetRid);
-	}
+	// ─── Y Coordinate Fix ──────────────────────────────────────
 
-	// ─── Y coordinate fix ──────────────────────────────────────
-	// v944 sends Y as SignedVarInt (ZigZag), PMMP reads as UnsignedVarInt
-	// Fix: ZigZag-decode the Y value
-
-	public static function fixInboundY(int $rawY) : int{
+	/**
+	 * v944+ sends BlockPosition Y as SignedVarInt (ZigZag),
+	 * but PMMP reads it as UnsignedVarInt.
+	 * ZigZag decode: (raw >> 1) ^ -(raw & 1)
+	 */
+	private function fixY(int $rawY) : int{
+		if(!$this->needsYFix) return $rawY;
 		return ($rawY >> 1) ^ -($rawY & 1);
 	}
 
-	public static function fixBlockPosition(BlockPosition $pos) : BlockPosition{
-		$fixedY = self::fixInboundY($pos->getY());
-		if($fixedY !== $pos->getY()){
-			return new BlockPosition($pos->getX(), $fixedY, $pos->getZ());
-		}
-		return $pos;
+	private function fixBlockPosition(BlockPosition $pos) : BlockPosition{
+		if(!$this->needsYFix) return $pos;
+		$fixedY = $this->fixY($pos->getY());
+		return ($fixedY !== $pos->getY()) ? new BlockPosition($pos->getX(), $fixedY, $pos->getZ()) : $pos;
 	}
 
-	// ─── Outbound packet translation ───────────────────────────
+	// ─── Outbound Translation ──────────────────────────────────
 
 	/**
 	 * Translate block runtime IDs in an outbound packet.
-	 * Returns cloned packet if modified, original if unchanged.
+	 * Always clones before modifying to protect shared packet objects.
 	 */
 	public function translateOutbound(ClientboundPacket $packet) : ClientboundPacket{
-		// UpdateBlockPacket + UpdateBlockSyncedPacket
 		if($packet instanceof UpdateBlockPacket){
 			$packet = clone $packet;
-			$packet->blockRuntimeId = $this->mapBlockIdToTarget($packet->blockRuntimeId);
+			$packet->blockRuntimeId = $this->toTarget($packet->blockRuntimeId);
 			return $packet;
 		}
 
-		// UpdateSubChunkBlocksPacket
 		if($packet instanceof UpdateSubChunkBlocksPacket){
-			return $this->translateUpdateSubChunkBlocks($packet);
+			return $this->translateSubChunkBlocks($packet);
 		}
 
-		// LevelSoundEventPacket
 		if($packet instanceof LevelSoundEventPacket){
 			if($packet->extraData > 0){
 				$packet = clone $packet;
-				$packet->extraData = $this->mapBlockIdToTarget($packet->extraData);
+				$packet->extraData = $this->toTarget($packet->extraData);
 			}
 			return $packet;
 		}
 
-		// LevelEventPacket
 		if($packet instanceof LevelEventPacket){
 			return $this->translateLevelEvent($packet);
 		}
 
-		// UpdateClientInputLocksPacket: v944 removes serverPosition (Vector3f = 12 bytes)
-		// PMMP sends: lockComponentData(varint) + serverPosition(3x floatLE)
-		// v944 expects: lockComponentData(varint) only
-		// We handle this by intercepting the encoded packet — but since we can't
-		// modify encoding easily, and the v944 client tolerates extra trailing data,
-		// this is safe to pass through. If issues arise, implement raw buffer stripping.
-
 		return $packet;
 	}
 
-	private function translateUpdateSubChunkBlocks(UpdateSubChunkBlocksPacket $packet) : UpdateSubChunkBlocksPacket{
+	private function translateSubChunkBlocks(UpdateSubChunkBlocksPacket $packet) : UpdateSubChunkBlocksPacket{
 		$packet = clone $packet;
 
-		// Layer 0 entries
-		$newLayer0 = [];
-		foreach($packet->getBlockChanges() as $entry){
-			$newLayer0[] = new \pocketmine\network\mcpe\protocol\types\UpdateSubChunkBlocksPacketEntry(
-				$entry->getBlockPosition(),
-				$this->mapBlockIdToTarget($entry->getBlockRuntimeId()),
-				$entry->getFlags(),
-				$entry->getSyncedUpdateActorUniqueId(),
-				$entry->getSyncedUpdateType()
-			);
-		}
+		$mapEntries = function(array $entries) : array{
+			$result = [];
+			foreach($entries as $entry){
+				$result[] = new UpdateSubChunkBlocksPacketEntry(
+					$entry->getBlockPosition(),
+					$this->toTarget($entry->getBlockRuntimeId()),
+					$entry->getFlags(),
+					$entry->getSyncedUpdateActorUniqueId(),
+					$entry->getSyncedUpdateType()
+				);
+			}
+			return $result;
+		};
 
-		// Layer 1 entries (waterlogging etc.)
-		$newLayer1 = [];
-		foreach($packet->getExtraBlockChanges() as $entry){
-			$newLayer1[] = new \pocketmine\network\mcpe\protocol\types\UpdateSubChunkBlocksPacketEntry(
-				$entry->getBlockPosition(),
-				$this->mapBlockIdToTarget($entry->getBlockRuntimeId()),
-				$entry->getFlags(),
-				$entry->getSyncedUpdateActorUniqueId(),
-				$entry->getSyncedUpdateType()
-			);
-		}
-
-		// Reconstruct packet via reflection (fields are private)
-		$ref = new \ReflectionClass($packet);
-		$ref->getProperty("blockChanges")->setValue($packet, $newLayer0);
-		$ref->getProperty("extraBlockChanges")->setValue($packet, $newLayer1);
+		ReflectionCache::setValue($packet, "layer0Updates", $mapEntries($packet->getLayer0Updates()));
+		ReflectionCache::setValue($packet, "layer1Updates", $mapEntries($packet->getLayer1Updates()));
 
 		return $packet;
 	}
@@ -149,148 +123,107 @@ class PacketTranslationHelper{
 			case 2021: // PARTICLE_DESTROY_NO_SOUND
 			case 0x4000 | 15: // ADD_PARTICLE_MASK | TERRAIN
 				$packet = clone $packet;
-				$packet->eventData = $this->mapBlockIdToTarget($packet->eventData);
+				$packet->eventData = $this->toTarget($packet->eventData);
 				return $packet;
 
 			case 2014: // PARTICLE_PUNCH_BLOCK
-			case 3603: case 3604: case 3605: // PUNCH_BLOCK direction variants
-			case 3606: case 3607: case 3608:
+			case 3603: case 3604: case 3605: case 3606: case 3607: case 3608:
 				$packet = clone $packet;
 				$rid = $packet->eventData & 0xFFFFFF;
 				$upper = $packet->eventData & ~0xFFFFFF;
-				$packet->eventData = $this->mapBlockIdToTarget($rid) | $upper;
+				$packet->eventData = $this->toTarget($rid) | $upper;
 				return $packet;
 		}
 		return $packet;
 	}
 
-	// ─── Inbound packet translation ────────────────────────────
+	// ─── Inbound Translation ───────────────────────────────────
 
 	/**
-	 * Translate block runtime IDs and fix Y coordinates in inbound packets.
+	 * Reverse-translate block runtime IDs and fix Y coordinates
+	 * in all relevant inbound packets.
 	 */
 	public function translateInbound(ServerboundPacket $packet) : void{
-		// InventoryTransactionPacket
 		if($packet instanceof \pocketmine\network\mcpe\protocol\InventoryTransactionPacket){
 			if($packet->trData instanceof UseItemTransactionData){
-				$this->fixUseItemTransactionData($packet->trData);
+				$this->fixUseItemData($packet->trData);
 			}
 			return;
 		}
 
-		// PlayerAuthInputPacket
 		if($packet instanceof \pocketmine\network\mcpe\protocol\PlayerAuthInputPacket){
-			// itemInteractionData
 			$interaction = $packet->getItemInteractionData();
 			if($interaction !== null){
-				$this->fixUseItemTransactionData($interaction->getTransactionData());
+				$this->fixUseItemData($interaction->getTransactionData());
 			}
-
-			// blockActions (PlayerBlockActionWithBlockInfo contains BlockPosition)
-			$blockActions = $packet->getBlockActions();
-			if($blockActions !== null){
-				foreach($blockActions as $action){
-					if($action instanceof \pocketmine\network\mcpe\protocol\types\PlayerBlockActionWithBlockInfo){
-						$this->fixBlockPositionInObject($action, "blockPosition");
-					}
-				}
-			}
+			$this->fixBlockActionsY($packet);
 			return;
 		}
 
-		// LevelSoundEventPacket inbound
 		if($packet instanceof LevelSoundEventPacket){
 			if($packet->extraData > 0){
-				$packet->extraData = $this->mapBlockIdToBase($packet->extraData);
+				$packet->extraData = $this->toBase($packet->extraData);
 			}
 			return;
 		}
 
-		// All other serverbound packets with BlockPosition — fix Y coordinate
-		$this->fixBlockPositionPackets($packet);
+		// Fix Y in other serverbound packets with BlockPosition
+		$this->fixGenericBlockPosition($packet);
 	}
 
-	/**
-	 * Fix UseItemTransactionData: blockPosition Y + blockRuntimeId + itemStack blockRuntimeId
-	 */
-	private function fixUseItemTransactionData(UseItemTransactionData $data) : void{
-		// Fix blockPosition Y
-		$this->fixBlockPositionInObject($data, "blockPosition");
+	private function fixUseItemData(UseItemTransactionData $data) : void{
+		// Fix BlockPosition Y
+		$bp = $data->getBlockPosition();
+		$fixed = $this->fixBlockPosition($bp);
+		if($fixed !== $bp){
+			ReflectionCache::setValue($data, "blockPosition", $fixed);
+		}
 
-		// Fix blockRuntimeId (clicked block)
-		$ref = new \ReflectionProperty($data, "blockRuntimeId");
-		$ref->setValue($data, $this->mapBlockIdToBase($data->getBlockRuntimeId()));
+		// Reverse-translate block runtime ID (clicked block)
+		ReflectionCache::setValue($data, "blockRuntimeId", $this->toBase($data->getBlockRuntimeId()));
 
-		// Fix itemInHand → ItemStack::blockRuntimeId
+		// Reverse-translate ItemStack::blockRuntimeId (held item)
 		$stack = $data->getItemInHand()->getItemStack();
 		if(!$stack->isNull() && $stack->getBlockRuntimeId() !== 0){
-			$ref = new \ReflectionProperty($stack, "blockRuntimeId");
-			$ref->setValue($stack, $this->mapBlockIdToBase($stack->getBlockRuntimeId()));
+			ReflectionCache::setValue($stack, "blockRuntimeId", $this->toBase($stack->getBlockRuntimeId()));
 		}
 	}
 
+	private function fixBlockActionsY(\pocketmine\network\mcpe\protocol\PlayerAuthInputPacket $packet) : void{
+		// PlayerBlockActionWithBlockInfo uses getSignedBlockPosition() which already
+		// reads Y as SignedVarInt (ZigZag). No Y fix needed here — applying it would
+		// double-decode and corrupt the Y coordinate.
+	}
+
 	/**
-	 * Fix BlockPosition Y coordinate in an object's property via Reflection.
+	 * Fix BlockPosition Y in generic serverbound packets.
 	 */
-	private function fixBlockPositionInObject(object $obj, string $propertyName) : void{
-		try{
-			$ref = new \ReflectionProperty($obj, $propertyName);
-			$pos = $ref->getValue($obj);
-			if($pos instanceof BlockPosition){
-				$fixed = self::fixBlockPosition($pos);
-				if($fixed !== $pos){
-					$ref->setValue($obj, $fixed);
-				}
+	private function fixGenericBlockPosition(ServerboundPacket $packet) : void{
+		if(!$this->needsYFix) return;
+
+		$classes = [
+			\pocketmine\network\mcpe\protocol\BlockActorDataPacket::class,
+			\pocketmine\network\mcpe\protocol\PlayerActionPacket::class,
+			\pocketmine\network\mcpe\protocol\BlockPickRequestPacket::class,
+			\pocketmine\network\mcpe\protocol\AnvilDamagePacket::class,
+			\pocketmine\network\mcpe\protocol\CommandBlockUpdatePacket::class,
+			\pocketmine\network\mcpe\protocol\LecternUpdatePacket::class,
+			\pocketmine\network\mcpe\protocol\StructureBlockUpdatePacket::class,
+		];
+
+		foreach($classes as $class){
+			if($packet instanceof $class){
+				try{
+					$bp = ReflectionCache::getValue($packet, "blockPosition");
+					if($bp instanceof BlockPosition){
+						$fixed = $this->fixBlockPosition($bp);
+						if($fixed !== $bp){
+							ReflectionCache::setValue($packet, "blockPosition", $fixed);
+						}
+					}
+				}catch(\ReflectionException){}
+				return;
 			}
-		}catch(\ReflectionException){
-			// Property doesn't exist — skip
-		}
-	}
-
-	/**
-	 * Fix BlockPosition in other serverbound packets that contain block positions.
-	 */
-	private function fixBlockPositionPackets(ServerboundPacket $packet) : void{
-		// BlockActorDataPacket
-		if($packet instanceof \pocketmine\network\mcpe\protocol\BlockActorDataPacket){
-			$this->fixBlockPositionInObject($packet, "blockPosition");
-			return;
-		}
-
-		// PlayerActionPacket
-		if($packet instanceof \pocketmine\network\mcpe\protocol\PlayerActionPacket){
-			$this->fixBlockPositionInObject($packet, "blockPosition");
-			return;
-		}
-
-		// BlockPickRequestPacket
-		if($packet instanceof \pocketmine\network\mcpe\protocol\BlockPickRequestPacket){
-			$this->fixBlockPositionInObject($packet, "blockPosition");
-			return;
-		}
-
-		// AnvilDamagePacket
-		if($packet instanceof \pocketmine\network\mcpe\protocol\AnvilDamagePacket){
-			$this->fixBlockPositionInObject($packet, "blockPosition");
-			return;
-		}
-
-		// CommandBlockUpdatePacket
-		if($packet instanceof \pocketmine\network\mcpe\protocol\CommandBlockUpdatePacket){
-			$this->fixBlockPositionInObject($packet, "blockPosition");
-			return;
-		}
-
-		// LecternUpdatePacket
-		if($packet instanceof \pocketmine\network\mcpe\protocol\LecternUpdatePacket){
-			$this->fixBlockPositionInObject($packet, "blockPosition");
-			return;
-		}
-
-		// StructureBlockUpdatePacket
-		if($packet instanceof \pocketmine\network\mcpe\protocol\StructureBlockUpdatePacket){
-			$this->fixBlockPositionInObject($packet, "blockPosition");
-			return;
 		}
 	}
 }

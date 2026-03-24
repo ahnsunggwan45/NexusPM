@@ -55,4 +55,12 @@ class Codec_v944 extends AbstractCodec{
 	public function getProtocolVersion() : int{
 		return 944;
 	}
+
+	/**
+	 * v944 changed BlockPosition Y from UnsignedVarInt to SignedVarInt (ZigZag).
+	 * PMMP reads Y as unsigned, so we need to ZigZag-decode it.
+	 */
+	public function needsInboundYFix() : bool{
+		return true;
+	}
 }

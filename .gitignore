@@ -11,6 +11,8 @@ tools/
 
 # Dev docs
 NEXUSPM.md
+troubleshooting.md
+HOW_TO_UPDATE.md
 
 # IDE
 .idea/

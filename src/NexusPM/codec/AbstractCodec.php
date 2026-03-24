@@ -55,6 +55,14 @@ abstract class AbstractCodec implements VersionCodec{
 		return $this->droppedInboundIds;
 	}
 
+	/**
+	 * Override in subclasses that need Y-coordinate ZigZag fix.
+	 * Default: false (no fix needed).
+	 */
+	public function needsInboundYFix() : bool{
+		return false;
+	}
+
 	public function handleInbound(ServerboundPacket $packet) : ?ServerboundPacket{
 		$pid = $packet->pid();
 

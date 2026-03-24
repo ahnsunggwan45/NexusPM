@@ -42,11 +42,13 @@ class NexusBlockTranslator{
 	public function __construct(string $targetPaletteNbt, string $targetMetaMapJson){
 		$this->nativeTranslator = TypeConverter::getInstance()->getBlockTranslator();
 
-		// Pad meta map if palette has more entries (new blocks in target version)
+		// Build target palette: standard v944 palette + custom blocks from Customies
+		$targetPaletteNbt = $this->injectCustomBlocks($targetPaletteNbt);
+
+		// Pad meta map to match palette size
 		$paletteCount = count((new NetworkNbtSerializer())->readMultiple($targetPaletteNbt));
 		$metaMap = json_decode($targetMetaMapJson, true);
-		if(is_array($metaMap) && count($metaMap) < $paletteCount){
-			// Pad with 0 (default meta) for new entries
+		if(is_array($metaMap)){
 			while(count($metaMap) < $paletteCount){
 				$metaMap[] = 0;
 			}
@@ -54,10 +56,96 @@ class NexusBlockTranslator{
 		}
 
 		$this->targetDictionary = BlockStateDictionary::loadFromString($targetPaletteNbt, $targetMetaMapJson);
-
-		// Find fallback: "minecraft:info_update" or first block as fallback
 		$this->targetFallbackId = 0;
 		$this->buildCache();
+	}
+
+	/**
+	 * Inject custom blocks (from Customies or similar plugins) into the target palette.
+	 *
+	 * Compares the native palette with the standard target palette to find
+	 * blocks that exist in native but not in target — these are custom blocks.
+	 * Inserts them into the target palette using fnv164 hash sort (same as Customies).
+	 *
+	 * Result: a "v944 + custom blocks" palette that the v944 client can use.
+	 */
+	private function injectCustomBlocks(string $targetPaletteNbt) : string{
+		$netNbt = new NetworkNbtSerializer();
+
+		$targetRoots = $netNbt->readMultiple($targetPaletteNbt);
+		$nativeStates = $this->nativeTranslator->getBlockStateDictionary()->getStates();
+
+		// Build set of block names in target
+		$targetNames = [];
+		foreach($targetRoots as $root){
+			$tag = $root->mustGetCompoundTag();
+			$targetNames[$tag->getString("name")] = true;
+		}
+
+		// Find custom blocks: in native but not in target
+		$customEntries = [];
+		$seen = [];
+		foreach($nativeStates as $entry){
+			$name = $entry->getStateName();
+			if(!isset($targetNames[$name]) && !isset($seen[$name])){
+				$seen[$name] = true;
+				// This is a custom block — collect all its states from native
+			}
+		}
+
+		if(count($seen) === 0){
+			return $targetPaletteNbt; // No custom blocks to inject
+		}
+
+		// Collect custom block NBT tags from native palette
+		// We need to re-serialize from BlockStateDictionaryEntry to NBT
+		$customTags = [];
+		foreach($nativeStates as $entry){
+			if(isset($seen[$entry->getStateName()])){
+				$tag = \pocketmine\nbt\tag\CompoundTag::create()
+					->setString(\pocketmine\data\bedrock\block\BlockStateData::TAG_NAME, $entry->getStateName())
+					->setTag(\pocketmine\data\bedrock\block\BlockStateData::TAG_STATES,
+						\pocketmine\nbt\tag\CompoundTag::create());
+
+				// Copy state properties
+				foreach($entry->getRawStateProperties() as $propName => $propTag){
+					$tag->getCompoundTag(\pocketmine\data\bedrock\block\BlockStateData::TAG_STATES)
+						->setTag($propName, clone $propTag);
+				}
+
+				$customTags[] = $tag;
+			}
+		}
+
+		// Build combined palette: target blocks + custom blocks, sorted by fnv164
+		$allTags = [];
+		foreach($targetRoots as $root){
+			$allTags[] = $root->mustGetCompoundTag();
+		}
+		foreach($customTags as $tag){
+			$allTags[] = $tag;
+		}
+
+		// Sort by fnv164 hash of block name (same as Customies)
+		// Group by name first, then sort names by fnv164
+		$groups = [];
+		foreach($allTags as $tag){
+			$name = $tag->getString("name");
+			$groups[$name][] = $tag;
+		}
+
+		$names = array_keys($groups);
+		usort($names, static fn(string $a, string $b) => strcmp(hash("fnv164", $a), hash("fnv164", $b)));
+
+		// Rebuild palette NBT
+		$output = "";
+		foreach($names as $name){
+			foreach($groups[$name] as $tag){
+				$output .= $netNbt->write(new \pocketmine\nbt\TreeRoot($tag));
+			}
+		}
+
+		return $output;
 	}
 
 	private function buildCache() : void{
@@ -90,17 +178,23 @@ class NexusBlockTranslator{
 	/**
 	 * Translate server's native network runtime ID → target protocol runtime ID.
 	 * Used for outbound packets (server → client).
+	 *
+	 * For unmapped blocks (e.g., custom blocks from plugins), returns the
+	 * native runtime ID unchanged. The client uses the server's block palette
+	 * for custom blocks, so native IDs are valid.
 	 */
 	public function nativeToTarget(int $nativeRuntimeId) : int{
-		return $this->nativeToTargetCache[$nativeRuntimeId] ?? $this->targetFallbackId;
+		return $this->nativeToTargetCache[$nativeRuntimeId] ?? $nativeRuntimeId;
 	}
 
 	/**
 	 * Translate target protocol runtime ID → server's native network runtime ID.
 	 * Used for inbound packets (client → server).
+	 *
+	 * For unmapped blocks, returns the target ID unchanged.
 	 */
 	public function targetToNative(int $targetRuntimeId) : int{
-		return $this->targetToNativeCache[$targetRuntimeId] ?? 0;
+		return $this->targetToNativeCache[$targetRuntimeId] ?? $targetRuntimeId;
 	}
 
 	/**
@@ -122,7 +216,9 @@ class NexusBlockTranslator{
 		}
 
 		$targetRid = $this->targetDictionary->lookupStateIdFromData($stateData);
-		$result = $targetRid ?? $this->targetFallbackId;
+		// For custom blocks not in target palette, use native ID (pass-through)
+		$nativeRid = $this->nativeTranslator->getBlockStateDictionary()->lookupStateIdFromData($stateData);
+		$result = $targetRid ?? $nativeRid ?? $internalStateId;
 		$this->internalToTargetCache[$internalStateId] = $result;
 		return $result;
 	}

@@ -14,6 +14,7 @@ use NexusPM\network\NexusNetworkSession;
 use NexusPM\network\NexusRakLibInterface;
 use NexusPM\network\PacketTranslationHelper;
 use NexusPM\utils\ProtocolVersions;
+use NexusPM\utils\ReflectionCache;
 use pocketmine\event\EventPriority;
 use pocketmine\event\player\PlayerQuitEvent;
 use pocketmine\event\server\DataPacketDecodeEvent;
@@ -67,14 +68,39 @@ class Main extends PluginBase{
 	protected function onEnable() : void{
 		$this->codecRegistry = new CodecRegistry();
 		$this->registerCodecs();
-		$this->loadVersionData();
 		$this->installNetworkLayer();
 		$this->installEventHandlers();
 
-		$base = ProtocolVersions::BASE_PROTOCOL;
-		$baseName = ProtocolVersions::VERSION_NAMES[$base];
-		$extra = $this->codecRegistry->getRegisteredVersions();
-		$this->getLogger()->info("NexusPM enabled — Base: $base ($baseName), Additional: " . implode(", ", $extra));
+		// Defer data loading to first tick — ensures plugins like Customies
+		// have finished modifying the block palette before we build our mapping cache.
+		// Customies re-sorts BlockStateDictionary by fnv164 hash when registering
+		// custom blocks, which changes ALL vanilla runtime IDs.
+		$this->getScheduler()->scheduleDelayedTask(new \pocketmine\scheduler\ClosureTask(
+			function() : void{
+				$this->loadVersionData();
+				$this->updateSessionTranslators();
+
+				$base = ProtocolVersions::BASE_PROTOCOL;
+				$baseName = ProtocolVersions::VERSION_NAMES[$base];
+				$extra = $this->codecRegistry->getRegisteredVersions();
+				$this->getLogger()->info("NexusPM ready — Base: $base ($baseName), Additional: " . implode(", ", $extra));
+			}
+		), 1);
+
+		$this->getLogger()->info("NexusPM enabled — waiting for other plugins to finish loading...");
+	}
+
+	/**
+	 * Update NexusRakLibInterface and existing sessions with fresh mapping data.
+	 * Called after deferred loadVersionData() completes.
+	 */
+	private function updateSessionTranslators() : void{
+		// Update NexusRakLibInterface contexts
+		foreach($this->getServer()->getNetwork()->getInterfaces() as $iface){
+			if($iface instanceof NexusRakLibInterface){
+				$iface->setNexusContext($this->codecRegistry, $this->chunkRewriters, $this->itemTables, $this->blockTranslators);
+			}
+		}
 	}
 
 	// ─── Codec Registration ────────────────────────────────────
@@ -248,36 +274,67 @@ class Main extends PluginBase{
 	 * UpdateBlockPacket, LevelSoundEventPacket, LevelEventPacket,
 	 * and UpdateSubChunkBlocksPacket all need block ID translation.
 	 */
-	public function onSend(DataPacketSendEvent $event) : void{
-		$targets = $event->getTargets();
+	private bool $isResending = false;
 
-		$helper = null;
-		$hasBase = false;
+	public function onSend(DataPacketSendEvent $event) : void{
+		if($this->isResending) return;
+
+		$targets = $event->getTargets();
+		$packets = $event->getPackets();
+
+		// Categorize targets
+		$baseTargets = [];
+		/** @var array<int, array{session: \pocketmine\network\mcpe\NetworkSession, helper: PacketTranslationHelper}> */
+		$translatedTargets = [];
+
 		foreach($targets as $t){
 			$info = $this->translatedSessions[spl_object_id($t)] ?? null;
-			if($info !== null){
-				$helper ??= $info["helper"];
+			if($info !== null && $info["helper"] !== null){
+				$translatedTargets[] = ["session" => $t, "helper" => $info["helper"]];
 			}else{
-				$hasBase = true;
+				$baseTargets[] = $t;
 			}
 		}
 
-		if($helper === null) return;
+		if(count($translatedTargets) === 0) return;
 
-		// Mixed sessions: can't use setPackets() as it affects all targets.
-		// Only translate when all targets share the same translation.
-		if($hasBase) return;
-
-		$packets = $event->getPackets();
-		$translated = [];
-		$changed = false;
-		foreach($packets as $pkt){
-			$result = $helper->translateOutbound($pkt);
-			if($result !== $pkt) $changed = true;
-			$translated[] = $result;
+		// All-translated (no base clients): use setPackets() for efficiency
+		if(count($baseTargets) === 0){
+			// Check all share the same protocol (common case)
+			$helper = $translatedTargets[0]["helper"];
+			$translated = [];
+			$changed = false;
+			foreach($packets as $pkt){
+				$result = $helper->translateOutbound($pkt);
+				if($result !== $pkt) $changed = true;
+				$translated[] = $result;
+			}
+			if($changed) $event->setPackets($translated);
+			return;
 		}
 
-		if($changed) $event->setPackets($translated);
+		// Mixed (base + translated clients): cancel and re-send per-group
+		$event->cancel();
+		$this->isResending = true;
+		try{
+			// Send original packets to base clients
+			foreach($baseTargets as $target){
+				foreach($packets as $pkt){
+					$target->sendDataPacket($pkt);
+				}
+			}
+			// Send translated packets to each translated client
+			foreach($translatedTargets as $entry){
+				$helper = $entry["helper"];
+				$session = $entry["session"];
+				foreach($packets as $pkt){
+					$translated = $helper->translateOutbound($pkt);
+					$session->sendDataPacket($translated);
+				}
+			}
+		}finally{
+			$this->isResending = false;
+		}
 	}
 
 	public function onQuit(PlayerQuitEvent $event) : void{
@@ -314,7 +371,7 @@ class Main extends PluginBase{
 		];
 
 		// Spoof protocol version so PMMP accepts the connection
-		(new \ReflectionProperty($packet, "protocolVersion"))->setValue($packet, ProtocolInfo::CURRENT_PROTOCOL);
+		ReflectionCache::setValue($packet, "protocolVersion", ProtocolInfo::CURRENT_PROTOCOL);
 
 		$this->getLogger()->info("[NexusPM] Client v{$protocol} ({$codec->getGameVersion()}) accepted");
 	}

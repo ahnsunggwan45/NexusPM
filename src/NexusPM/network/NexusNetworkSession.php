@@ -56,6 +56,10 @@ class NexusNetworkSession extends NetworkSession{
 	private int $clientProtocol = 0;
 	private bool $translationActive = false;
 
+	/** @var array<string, string> md5(compressed) => rewritten compressed — chunk rewrite cache */
+	private array $chunkCache = [];
+	private const CHUNK_CACHE_MAX = 256;
+
 	private CodecRegistry $codecRegistry;
 	/** @var array<int, ChunkRewriter> */
 	private array $chunkRewriters;
@@ -104,7 +108,8 @@ class NexusNetworkSession extends NetworkSession{
 		$mapper = $this->chunkRewriter?->getMapper();
 		$blockTranslator = $this->blockTranslators[$protocol] ?? null;
 		if($mapper !== null){
-			$this->translationHelper = new PacketTranslationHelper($mapper, $blockTranslator);
+			$needsYFix = $this->codec?->needsInboundYFix() ?? false;
+			$this->translationHelper = new PacketTranslationHelper($mapper, $blockTranslator, $needsYFix);
 		}
 
 		$this->translationActive = ($this->codec !== null);
@@ -114,8 +119,20 @@ class NexusNetworkSession extends NetworkSession{
 
 	public function queueCompressed(CompressBatchPromise|string $payload, bool $immediate = false) : void{
 		if($this->translationActive && $this->chunkRewriter !== null && is_string($payload)){
+			// Check cache first (same chunk data sent to multiple sessions)
+			$hash = md5($payload);
+			if(isset($this->chunkCache[$hash])){
+				parent::queueCompressed($this->chunkCache[$hash], $immediate);
+				return;
+			}
+
 			$rewritten = $this->rewriteCompressedBatch($payload);
 			if($rewritten !== null){
+				// Cache the result
+				if(count($this->chunkCache) >= self::CHUNK_CACHE_MAX){
+					array_shift($this->chunkCache); // evict oldest
+				}
+				$this->chunkCache[$hash] = $rewritten;
 				parent::queueCompressed($rewritten, $immediate);
 				return;
 			}

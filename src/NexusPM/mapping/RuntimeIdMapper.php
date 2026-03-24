@@ -100,7 +100,7 @@ class RuntimeIdMapper{
 	 * Used for outbound packets (server→client).
 	 */
 	public function toTarget(int $baseRuntimeId) : int{
-		return $this->baseToTarget[$baseRuntimeId] ?? $this->fallbackTargetId;
+		return $this->baseToTarget[$baseRuntimeId] ?? $baseRuntimeId;
 	}
 
 	/**
@@ -108,7 +108,7 @@ class RuntimeIdMapper{
 	 * Used for inbound packets (client→server).
 	 */
 	public function toBase(int $targetRuntimeId) : int{
-		return $this->targetToBase[$targetRuntimeId] ?? $this->fallbackBaseId;
+		return $this->targetToBase[$targetRuntimeId] ?? $targetRuntimeId;
 	}
 
 	public function getMappedCount() : int{
