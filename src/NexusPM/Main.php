@@ -24,6 +24,7 @@ use pocketmine\event\server\NetworkInterfaceRegisterEvent;
 use pocketmine\network\mcpe\convert\TypeConverter;
 use pocketmine\network\mcpe\protocol\ProtocolInfo;
 use pocketmine\network\mcpe\protocol\RequestNetworkSettingsPacket;
+use pocketmine\network\mcpe\protocol\StartGamePacket;
 use pocketmine\network\mcpe\raklib\RakLibInterface;
 use pocketmine\network\mcpe\StandardEntityEventBroadcaster;
 use pocketmine\network\mcpe\StandardPacketBroadcaster;
@@ -148,7 +149,12 @@ class Main extends PluginBase{
 				$translator = new NexusBlockTranslator($palette, file_get_contents($metaMapFile));
 				$this->blockTranslators[$protocol] = $translator;
 				$this->chunkRewriters[$protocol] = ChunkRewriter::fromBlockTranslator($translator);
-				$this->getLogger()->info("v{$protocol}: block translator (2-step, {$translator->getChangedCount()} remapped)");
+				$unmapped = $translator->getUnmappedBlocks();
+				$this->getLogger()->info("v{$protocol}: block translator (2-step, {$translator->getChangedCount()} remapped, " . count($unmapped) . " unmapped)");
+				if(count($unmapped) > 0){
+					$this->getLogger()->warning("v{$protocol}: unmapped blocks: " . implode(", ", array_slice($unmapped, 0, 20)) . (count($unmapped) > 20 ? "... (" . count($unmapped) . " total)" : ""));
+				}
+
 				return;
 			}catch(\Throwable $e){
 				$this->getLogger()->warning("v{$protocol}: 2-step failed ({$e->getMessage()}), falling back to palette mapping");
@@ -223,6 +229,7 @@ class Main extends PluginBase{
 		$pm->registerEvent(DataPacketDecodeEvent::class, $this->onDecode(...), EventPriority::LOWEST, $this);
 		$pm->registerEvent(DataPacketReceiveEvent::class, $this->onReceive(...), EventPriority::LOWEST, $this);
 		$pm->registerEvent(DataPacketSendEvent::class, $this->onSend(...), EventPriority::LOWEST, $this);
+		$pm->registerEvent(DataPacketSendEvent::class, $this->onSendLate(...), EventPriority::HIGHEST, $this);
 		$pm->registerEvent(PlayerQuitEvent::class, $this->onQuit(...), EventPriority::MONITOR, $this);
 	}
 
@@ -334,6 +341,32 @@ class Main extends PluginBase{
 			}
 		}finally{
 			$this->isResending = false;
+		}
+	}
+
+	/**
+	 * Late-stage StartGamePacket handler.
+	 * Customies sets blockPalette to custom block definitions only (not vanilla blocks).
+	 * The client merges these with its internal vanilla blocks and sorts by fnv164.
+	 * This matches our target dictionary's fnv164 sort order — no modification needed.
+	 */
+	public function onSendLate(DataPacketSendEvent $event) : void{
+		// Customies' custom block entries pass through unchanged.
+		// Fix StartGamePacket's spawnPosition Y for v944
+		foreach($event->getPackets() as $packet){
+			if(!($packet instanceof StartGamePacket)) continue;
+			foreach($event->getTargets() as $target){
+				$info = $this->translatedSessions[spl_object_id($target)] ?? null;
+				if($info === null) continue;
+				$codec = $info["codec"];
+				if($codec !== null && $codec->needsInboundYFix()){
+					$sp = $packet->levelSettings->spawnPosition;
+					$y = $sp->getY();
+					$packet->levelSettings->spawnPosition = new \pocketmine\network\mcpe\protocol\types\BlockPosition(
+						$sp->getX(), ($y << 1) ^ ($y >> 31), $sp->getZ()
+					);
+				}
+			}
 		}
 	}
 

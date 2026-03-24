@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace NexusPM\mapping;
 
 use pocketmine\data\bedrock\block\BlockStateData;
+use pocketmine\nbt\tag\CompoundTag;
 use pocketmine\network\mcpe\convert\BlockStateDictionary;
 use pocketmine\network\mcpe\convert\BlockTranslator;
 use pocketmine\network\mcpe\convert\TypeConverter;
 use pocketmine\network\mcpe\protocol\serializer\NetworkNbtSerializer;
+use pocketmine\network\mcpe\protocol\types\BlockPaletteEntry;
+use pocketmine\network\mcpe\protocol\types\CacheableNbt;
 use pocketmine\world\format\io\GlobalBlockStateHandlers;
 
 /**
@@ -39,14 +42,31 @@ class NexusBlockTranslator{
 	private BlockStateDictionary $targetDictionary;
 	private int $targetFallbackId;
 
+	/** @var BlockPaletteEntry[] Cached palette entries for StartGamePacket */
+	private array $paletteEntries = [];
+
+	/** @var array<string, true> Custom block names (in native but not in standard target) */
+	private array $customBlockNames = [];
+
 	public function __construct(string $targetPaletteNbt, string $targetMetaMapJson){
 		$this->nativeTranslator = TypeConverter::getInstance()->getBlockTranslator();
 
 		// Build target palette: standard v944 palette + custom blocks from Customies
 		$targetPaletteNbt = $this->injectCustomBlocks($targetPaletteNbt);
 
+		// Build palette entries from raw NBT (for StartGamePacket)
+		$netNbt = new NetworkNbtSerializer();
+		$roots = $netNbt->readMultiple($targetPaletteNbt);
+		$this->paletteEntries = [];
+		foreach($roots as $root){
+			$tag = $root->mustGetCompoundTag();
+			$name = $tag->getString(BlockStateData::TAG_NAME);
+			$states = $tag->getCompoundTag(BlockStateData::TAG_STATES) ?? CompoundTag::create();
+			$this->paletteEntries[] = new BlockPaletteEntry($name, new CacheableNbt(clone $states));
+		}
+
 		// Pad meta map to match palette size
-		$paletteCount = count((new NetworkNbtSerializer())->readMultiple($targetPaletteNbt));
+		$paletteCount = count($roots);
 		$metaMap = json_decode($targetMetaMapJson, true);
 		if(is_array($metaMap)){
 			while(count($metaMap) < $paletteCount){
@@ -56,7 +76,11 @@ class NexusBlockTranslator{
 		}
 
 		$this->targetDictionary = BlockStateDictionary::loadFromString($targetPaletteNbt, $targetMetaMapJson);
-		$this->targetFallbackId = 0;
+		// Use info_update ("?" block) as fallback so unmapped blocks are visible
+		$infoUpdate = $this->targetDictionary->lookupStateIdFromData(
+			BlockStateData::current(\pocketmine\data\bedrock\block\BlockTypeNames::INFO_UPDATE, [])
+		);
+		$this->targetFallbackId = $infoUpdate ?? 0;
 		$this->buildCache();
 	}
 
@@ -93,31 +117,33 @@ class NexusBlockTranslator{
 			}
 		}
 
+		$this->customBlockNames = $seen;
+
 		if(count($seen) === 0){
 			return $targetPaletteNbt; // No custom blocks to inject
 		}
 
 		// Collect custom block NBT tags from native palette
-		// We need to re-serialize from BlockStateDictionaryEntry to NBT
 		$customTags = [];
 		foreach($nativeStates as $entry){
 			if(isset($seen[$entry->getStateName()])){
-				$tag = \pocketmine\nbt\tag\CompoundTag::create()
-					->setString(\pocketmine\data\bedrock\block\BlockStateData::TAG_NAME, $entry->getStateName())
-					->setTag(\pocketmine\data\bedrock\block\BlockStateData::TAG_STATES,
-						\pocketmine\nbt\tag\CompoundTag::create());
-
-				// Copy state properties
-				foreach($entry->getRawStateProperties() as $propName => $propTag){
-					$tag->getCompoundTag(\pocketmine\data\bedrock\block\BlockStateData::TAG_STATES)
-						->setTag($propName, clone $propTag);
+				$stateData = $entry->generateStateData();
+				$statesTag = CompoundTag::create();
+				foreach($stateData->getStates() as $propName => $propTag){
+					$statesTag->setTag($propName, clone $propTag);
 				}
+
+				$tag = CompoundTag::create()
+					->setString(BlockStateData::TAG_NAME, $entry->getStateName())
+					->setTag(BlockStateData::TAG_STATES, $statesTag);
 
 				$customTags[] = $tag;
 			}
 		}
 
-		// Build combined palette: target blocks + custom blocks, sorted by fnv164
+		// Build combined palette: target blocks + custom blocks, sorted by fnv164.
+		// The client also merges vanilla + custom and sorts by fnv164,
+		// so the target dictionary indices must match the client's sort order.
 		$allTags = [];
 		foreach($targetRoots as $root){
 			$allTags[] = $root->mustGetCompoundTag();
@@ -126,8 +152,7 @@ class NexusBlockTranslator{
 			$allTags[] = $tag;
 		}
 
-		// Sort by fnv164 hash of block name (same as Customies)
-		// Group by name first, then sort names by fnv164
+		// Group by name, sort names by fnv164 hash (same as Customies + client)
 		$groups = [];
 		foreach($allTags as $tag){
 			$name = $tag->getString("name");
@@ -148,40 +173,50 @@ class NexusBlockTranslator{
 		return $output;
 	}
 
+	/** @var string[] Block names that failed mapping (for diagnostics) */
+	private array $unmappedBlocks = [];
+
 	private function buildCache() : void{
 		$nativeDictionary = $this->nativeTranslator->getBlockStateDictionary();
-		$serializer = GlobalBlockStateHandlers::getSerializer();
 
-		// Iterate all PMMP internal state IDs
-		// The range of internal state IDs is not directly enumerable,
-		// so we build the cache lazily + pre-populate from the native palette
-		$nativeNetNbt = new NetworkNbtSerializer();
-
-		// For each entry in the native palette, build the mapping
-		// native palette index = native network runtime ID
-		// We can get the internal state ID from nativeTranslator
 		$nativePaletteSize = $this->nativeTranslator->getBlockStateDictionary()->getStates();
+		$unmappedNames = [];
 		foreach($nativePaletteSize as $nativeRid => $entry){
-			// native runtime ID → block state data
 			$stateData = $nativeDictionary->generateDataFromStateId($nativeRid);
 			if($stateData === null) continue;
 
-			// block state data → target runtime ID
 			$targetRid = $this->targetDictionary->lookupStateIdFromData($stateData);
 			if($targetRid !== null){
 				$this->nativeToTargetCache[$nativeRid] = $targetRid;
 				$this->targetToNativeCache[$targetRid] = $nativeRid;
+			}else{
+				// Track unmapped blocks for diagnostics (one per block name)
+				$name = $stateData->getName();
+				if(!isset($unmappedNames[$name])){
+					$unmappedNames[$name] = true;
+					$this->unmappedBlocks[] = $name;
+				}
+				// Map to fallback (info_update / update block) instead of passing through
+				// native ID, which would map to a completely wrong block in the target palette
+				$this->nativeToTargetCache[$nativeRid] = $this->targetFallbackId;
 			}
 		}
+	}
+
+	/**
+	 * @return string[] Block names that could not be mapped to target palette
+	 */
+	public function getUnmappedBlocks() : array{
+		return $this->unmappedBlocks;
 	}
 
 	/**
 	 * Translate server's native network runtime ID → target protocol runtime ID.
 	 * Used for outbound packets (server → client).
 	 *
-	 * For unmapped blocks (e.g., custom blocks from plugins), returns the
-	 * native runtime ID unchanged. The client uses the server's block palette
-	 * for custom blocks, so native IDs are valid.
+	 * Unmapped blocks are mapped to the fallback block (info_update) by buildCache().
+	 * If a runtime ID isn't in the cache at all (e.g., dynamically registered after init),
+	 * returns the native ID unchanged as a last resort.
 	 */
 	public function nativeToTarget(int $nativeRuntimeId) : int{
 		return $this->nativeToTargetCache[$nativeRuntimeId] ?? $nativeRuntimeId;
@@ -237,5 +272,20 @@ class NexusBlockTranslator{
 			if($native !== $target) $changed++;
 		}
 		return $changed;
+	}
+
+	/**
+	 * Get BlockPaletteEntry array for StartGamePacket (vanilla v944 only).
+	 * @return BlockPaletteEntry[]
+	 */
+	public function getBlockPaletteEntries() : array{
+		return $this->paletteEntries;
+	}
+
+	/**
+	 * @return array<string, true>
+	 */
+	public function getCustomBlockNames() : array{
+		return $this->customBlockNames;
 	}
 }
