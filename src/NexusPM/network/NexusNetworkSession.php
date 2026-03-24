@@ -113,6 +113,32 @@ class NexusNetworkSession extends NetworkSession{
 		}
 
 		$this->translationActive = ($this->codec !== null);
+		if($this->translationActive){
+			$this->structureRewriter = new PacketStructureRewriter();
+		}
+	}
+
+	// ─── Packet Structure Rewriting ────────────────────────────
+
+	private ?PacketStructureRewriter $structureRewriter = null;
+
+	/**
+	 * Override: rewrite packet structure (serialization format) for v944.
+	 *
+	 * addToSendBuffer receives already-encoded packet bytes from
+	 * StandardPacketBroadcaster and sendDataPacketInternal.
+	 * This is the ONLY point where we can modify outbound packet STRUCTURE
+	 * (as opposed to DATA, which is handled by PacketTranslationHelper).
+	 *
+	 * Required for WaterdogPE compatibility: WDPE decodes packets with
+	 * the v944 codec, which expects v944 structure. Without this, WDPE
+	 * fails to decode and the client disconnects.
+	 */
+	public function addToSendBuffer(string $buffer) : void{
+		if($this->structureRewriter !== null){
+			$buffer = $this->structureRewriter->rewrite($buffer);
+		}
+		parent::addToSendBuffer($buffer);
 	}
 
 	// ─── Chunk Interception ────────────────────────────────────
@@ -160,6 +186,7 @@ class NexusNetworkSession extends NetworkSession{
 		foreach($packet->getEntries() as $entry){
 			$name = $entry->getStringId();
 			if(isset($targetItems[$name])){
+				// Remap to target version's runtime ID, keep original componentNbt
 				$entries[] = new ItemTypeEntry(
 					$name,
 					$targetItems[$name]["runtime_id"],
@@ -167,9 +194,12 @@ class NexusNetworkSession extends NetworkSession{
 					$entry->getVersion(),
 					$entry->getComponentNbt()
 				);
-			}else{
+			}elseif($entry->isComponentBased()){
+				// Custom item (from plugins) — keep as-is even if not in target table
 				$entries[] = $entry;
 			}
+			// Items removed in target version (e.g., debug_stick in v944): DROP
+			// Their runtimeId would conflict with reassigned IDs in the target version
 		}
 
 		// Add items that exist only in the target version
@@ -229,6 +259,11 @@ class NexusNetworkSession extends NetworkSession{
 
 	private function rewriteChunkPacketBuffer(string $buffer) : string{
 		if(strlen($buffer) < 1) return $buffer;
+
+		// Apply structure rewriting to ALL packets in compressed batches
+		if($this->structureRewriter !== null){
+			$buffer = $this->structureRewriter->rewrite($buffer);
+		}
 
 		$off = 0;
 		$header = self::readUVarInt($buffer, $off);
