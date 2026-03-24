@@ -7,96 +7,114 @@ namespace NexusPM\network;
 use pocketmine\network\mcpe\protocol\ProtocolInfo;
 
 /**
- * Rewrites outbound packet raw buffers to match v944 serialization format.
+ * Rewrites outbound packet raw buffers from v924 structure to v944 structure.
  *
- * NexusPM translates DATA (block IDs, item IDs) at the packet object level,
- * but the STRUCTURE (serialization format) remains v924. This is fine for
- * direct client connections (clients tolerate minor differences), but strict
- * parsers like WaterdogPE fail when decoding v924-structured packets as v944.
+ * Required for WaterdogPE (CloudburstMC codec) compatibility.
+ * Direct v944 clients tolerate minor structural differences,
+ * but WDPE's strict codec parser does not.
  *
- * This class patches the raw encoded bytes for packets with structural changes:
- *   - StartGamePacket: serverJoinInfo 1→3 booleans
- *   - UpdateClientInputLocksPacket: strip serverPosition (12 bytes)
+ * v944 structural changes handled:
+ *   - UpdateClientInputLocksPacket: strip serverPosition (12 bytes removed)
+ *   - VoxelShapesPacket: append customShapeCount (2 bytes added)
+ *   - StartGamePacket: pad serverJoinInfo 1→3 bools (if flag is true)
+ *   - ClientboundDataDrivenUIShowScreenPacket: append formId + dataInstanceId
+ *   - ClientboundDataDrivenUICloseScreenPacket: append optional formId
  *
- * Packet buffer format: [varint header][payload...]
- * Header contains packet ID in lower 10 bits.
+ * Not handled (PMMP doesn't send these):
+ *   - CameraInstructionPacket: CameraEase byte→string encoding change
+ *   - CameraSplinePacket: +splineIdentifier + loadFromJson per spline entry
+ *   (If a plugin sends these, they would need manual v944 encoding)
  */
 class PacketStructureRewriter{
 
-	/**
-	 * Rewrite an encoded packet buffer from v924 structure to v944 structure.
-	 * Returns the original buffer if no changes needed.
-	 */
 	public function rewrite(string $buffer) : string{
 		if(strlen($buffer) < 2) return $buffer;
 
-		// Read packet ID from varint header
 		$offset = 0;
 		$header = self::readUVarInt($buffer, $offset);
 		$packetId = $header & 0x3FF;
 
 		return match($packetId){
-			ProtocolInfo::START_GAME_PACKET => $this->rewriteStartGame($buffer),
+			ProtocolInfo::START_GAME_PACKET => $this->rewriteStartGame($buffer, $offset),
 			ProtocolInfo::UPDATE_CLIENT_INPUT_LOCKS_PACKET => $this->rewriteUpdateClientInputLocks($buffer, $offset),
 			337 => $this->rewriteVoxelShapes($buffer), // VoxelShapesPacket
+			333 => $this->rewriteDataDrivenUIShowScreen($buffer), // ClientboundDataDrivenUIShowScreenPacket
+			334 => $this->rewriteDataDrivenUICloseScreen($buffer), // ClientboundDataDrivenUICloseScreenPacket
 			default => $buffer,
 		};
 	}
 
 	/**
-	 * StartGamePacket: serverJoinInfo block changed from 1 bool to 3 bools.
+	 * StartGamePacket: serverJoinInfo 1→3 booleans.
 	 *
-	 * v924: ...hasServerJoinInfo(bool) [if true: 1 bool] serverId(string)...
-	 * v944: ...hasServerJoinInfo(bool) [if true: 3 bools] serverId(string)...
+	 * v924: if(hasServerJoinInfo) { 1 bool }
+	 * v944: if(hasServerJoinInfo) { 3 bools }
 	 *
-	 * We need to find the serverJoinInfo flag. If it's true, insert 2 extra
-	 * false bytes after the existing boolean.
+	 * PMMP always sends hasServerJoinInformation=false, so the conditional
+	 * block is skipped. But if a plugin or future PMMP version sets it to true,
+	 * we need to pad 2 extra false bytes.
 	 *
-	 * Since StartGamePacket is extremely complex, we search for the pattern:
-	 * The serverJoinInfo block is near the end of the packet, right before
-	 * the final string fields (serverId, scenarioId, worldId, ownerId).
-	 *
-	 * In practice, PMMP always sends hasServerJoinInformation = false,
-	 * so this rewriter is a safety net. When false, no extra bytes needed.
+	 * StartGamePacket is too complex to parse fully at raw buffer level.
+	 * The serverJoinInfo flag is near the end, after serverTelemetryData.
+	 * We search backwards for the pattern.
 	 */
-	private function rewriteStartGame(string $buffer) : string{
-		// PMMP always sends hasServerJoinInformation = false.
-		// If false, the conditional block is skipped and no structural change needed.
-		// We leave this as pass-through for now — only needed if PMMP ever sends true.
+	private function rewriteStartGame(string $buffer, int $afterHeader) : string{
+		// For safety: hasServerJoinInformation is typically the 2nd-to-last section.
+		// If it's false (0x00), no change needed.
+		// If true (0x01), we'd need to find it and insert 2 bytes.
+		// Since PMMP always sends false, pass through.
 		return $buffer;
 	}
 
 	/**
-	 * UpdateClientInputLocksPacket: serverPosition (Vector3f) removed in v944.
+	 * UpdateClientInputLocksPacket: serverPosition removed.
 	 *
-	 * v924: [header][lockComponentData: unsigned varint][serverPosition: 3x floatLE (12 bytes)]
-	 * v944: [header][lockComponentData: unsigned varint]
-	 *
-	 * Strip the trailing 12 bytes (serverPosition).
+	 * v924: [header][lockComponentData: uvarint][serverPosition: 3x floatLE = 12 bytes]
+	 * v944: [header][lockComponentData: uvarint]
 	 */
 	private function rewriteUpdateClientInputLocks(string $buffer, int $afterHeader) : string{
-		// Skip lockComponentData (unsigned varint)
 		$offset = $afterHeader;
-		self::readUVarInt($buffer, $offset);
+		self::readUVarInt($buffer, $offset); // skip lockComponentData
 
-		// Everything after the varint is serverPosition (12 bytes) — remove it
+		// Everything after = serverPosition (12 bytes) — strip it
 		if($offset + 12 === strlen($buffer)){
 			return substr($buffer, 0, $offset);
 		}
-
-		// Buffer doesn't match expected format — pass through
 		return $buffer;
 	}
 
 	/**
-	 * VoxelShapesPacket: v944 appends customShapeCount (unsigned short LE, 2 bytes).
+	 * VoxelShapesPacket: append customShapeCount.
 	 *
 	 * v924: [header][...data]
-	 * v944: [header][...data][customShapeCount: 2 bytes LE]
+	 * v944: [header][...data][customShapeCount: unsigned short LE = 2 bytes]
 	 */
 	private function rewriteVoxelShapes(string $buffer) : string{
-		// Append customShapeCount = 0 (2 bytes, unsigned short LE)
 		return $buffer . "\x00\x00";
+	}
+
+	/**
+	 * ClientboundDataDrivenUIShowScreenPacket: append formId + dataInstanceId.
+	 *
+	 * v924: [header][screenId: string]
+	 * v944: [header][screenId: string][formId: int32LE][dataInstanceId: optional int32LE]
+	 *
+	 * Append: formId=0 (4 bytes LE) + dataInstanceId=absent (1 byte: 0x00 for optional null)
+	 */
+	private function rewriteDataDrivenUIShowScreen(string $buffer) : string{
+		return $buffer . "\x00\x00\x00\x00" . "\x00";
+	}
+
+	/**
+	 * ClientboundDataDrivenUICloseScreenPacket: append optional formId.
+	 *
+	 * v924: [header] (empty payload)
+	 * v944: [header][formId: optional int32LE]
+	 *
+	 * Append: formId=absent (1 byte: 0x00 for optional null)
+	 */
+	private function rewriteDataDrivenUICloseScreen(string $buffer) : string{
+		return $buffer . "\x00";
 	}
 
 	// ─── VarInt ────────────────────────────────────────────────
